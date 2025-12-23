@@ -5,6 +5,11 @@ import requests
 from datetime import datetime
 import csv
 import time
+import concurrent.futures
+import urllib3
+import threading
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Realistic User-Agents (desktop, mobile, different OSes)
 USER_AGENTS = [
@@ -20,11 +25,54 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 ]
 
-# Optional proxy list (add working proxies or leave empty)
-PROXIES = [
-    # "http://user:pass@proxyhost:port",
-    # "http://proxyhost:port"
-]
+# ADD YOUR PROXY URLS HERE
+http_proxies = 'https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/http.txt'
+https_proxies = 'https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/https.txt'
+
+# Colors for output
+GREEN = '\033[92m'
+RED = '\033[91m'
+YELLOW = '\033[93m'
+RESET = '\033[0m'
+
+# Make this false to disable proxy usage
+USE_PROXIES = True
+
+lock = threading.Lock()
+working_proxies = []
+
+def load_proxies():
+    proxies = []
+    try:
+        response = requests.get(http_proxies)
+        proxies.extend([line.strip() for line in response.text.splitlines() if line.strip()])
+    except Exception as e:
+        print(f"[!] Failed to load HTTP proxies: {e}")
+    try:
+        response = requests.get(https_proxies)
+        proxies.extend([line.strip() for line in response.text.splitlines() if line.strip()])
+    except Exception as e:
+        print(f"[!] Failed to load HTTPS proxies: {e}")
+    return list(set(proxies))
+
+def check_proxy(proxy):
+    try:
+        response = requests.get('http://httpbin.org/ip', proxies={'http': proxy, 'https': proxy}, timeout=5)
+        return response.status_code == 200
+    except:
+        return False
+
+def load_and_check_proxies(num_usernames):
+    all_proxies = load_proxies()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(check_proxy, proxy): proxy for proxy in all_proxies}
+        for future in concurrent.futures.as_completed(futures):
+            if future.result():
+                with lock:
+                    working_proxies.append(futures[future])
+                if len(working_proxies) >= num_usernames:
+                    break
+    print(f"✅ Found {len(working_proxies)} working proxies")
 
 # Round-robin User-Agent generator
 def user_agent_generator():
@@ -40,7 +88,8 @@ def get_next_user_agent():
     return next(user_agent_cycle)
 
 def get_random_proxy():
-    return random.choice(PROXIES) if PROXIES else None
+    with lock:
+        return random.choice(working_proxies) if working_proxies else None
 
 # Extract CSRF token from Instagram homepage
 def extractCsrftoken(session):
@@ -103,7 +152,7 @@ def checkUsernameAvailability(session, username, csrftoken):
             return "error"
 
     except Exception as e:
-        print(f"[!] Error checking '{username}': {e}")
+        print(f"{YELLOW}[!] Error checking '{username}': {e}{RESET}")
         return "error"
 
 # Load usernames from file (one per line)
@@ -126,15 +175,19 @@ def write_sorted_results(results, filename="output.csv"):
         for row in grouped:
             writer.writerow(row)
 
-# Main script logic
 def main():
     input_file = "usernames.txt"
     output_file = "output.csv"
 
     usernames = load_usernames(input_file)
+    num_usernames = len(usernames)
     if not usernames:
         print("[!] No usernames found in the file.")
         return
+
+    if USE_PROXIES:
+        print("🔍 Loading and checking proxies in background...")
+        threading.Thread(target=load_and_check_proxies, args=(num_usernames,), daemon=True).start()
 
     session = requests.session()
     csrftoken = extractCsrftoken(session)
@@ -144,7 +197,8 @@ def main():
 
     for username in usernames:
         status = checkUsernameAvailability(session, username, csrftoken)
-        print(f"{username}: {status}")
+        color = GREEN if status == 'available' else RED if status == 'taken' else YELLOW
+        print(f"{color}{username}: {status}{RESET}")
         results.append((username, status))
         time.sleep(5)  # Increased delay to avoid rate-limiting
 
